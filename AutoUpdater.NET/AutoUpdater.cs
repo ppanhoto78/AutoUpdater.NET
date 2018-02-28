@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -9,8 +10,10 @@ using System.Reflection;
 using System.Threading;
 using System.Windows.Forms;
 using System.Xml;
+using System.Linq;
 using AutoUpdaterDotNET.Properties;
 using Microsoft.Win32;
+using System.Collections;
 
 namespace AutoUpdaterDotNET
 {
@@ -73,9 +76,14 @@ namespace AutoUpdaterDotNET
         public static String AppTitle;
 
         /// <summary>
-        ///     URL of the xml file that contains information about latest version of the application.
+        ///     URL list of the xml file that contains information about latest version of the application.
         /// </summary>
-        public static String AppCastURL;
+        public static string[] AppCastURLList;
+
+        /// <summary>
+        ///     Next URL to be tested for.
+        /// </summary>
+        public static IEnumerator AppCastNext;
 
         /// <summary>
         ///     Opens the download url in default browser if true. Very usefull if you have portable application.
@@ -166,21 +174,27 @@ namespace AutoUpdaterDotNET
         /// <param name="myAssembly">Assembly to use for version checking.</param>
         public static void Start(Assembly myAssembly = null)
         {
-            Start(AppCastURL, myAssembly);
+            Start(AppCastURLList, myAssembly);
         }
 
         /// <summary>
         ///     Start checking for new version of application and display dialog to the user if update is available.
         /// </summary>
-        /// <param name="appCast">URL of the xml file that contains information about latest version of the application.</param>
-        /// <param name="myAssembly">Assembly to use for version checking.</param>
-        public static void Start(String appCast, Assembly myAssembly = null)
+        /// <param name="args">
+        ///     * List of URLs of the xml file that contains information about latest version of the application.
+        ///     optionally,  a last parameter can be:
+        ///     * Assembly to use for version checking
+        /// </param>
+        public static void Start(params object[] args)
         {
+            var appCastList = args.OfType<string>().ToArray();
+            Assembly myAssembly = args.Last() as Assembly;
             if (!Running && _remindLaterTimer == null)
             {
                 Running = true;
 
-                AppCastURL = appCast;
+                AppCastURLList = appCastList;
+                AppCastNext = appCastList.GetEnumerator();
 
                 IsWinFormsApplication = Application.MessageLoop;
 
@@ -267,209 +281,212 @@ namespace AutoUpdaterDotNET
 
         private static void BackgroundWorkerDoWork(object sender, DoWorkEventArgs e)
         {
-            e.Cancel = true;
-            Assembly mainAssembly = e.Argument as Assembly;
-
-            var companyAttribute =
-                (AssemblyCompanyAttribute) GetAttribute(mainAssembly, typeof(AssemblyCompanyAttribute));
-            if (string.IsNullOrEmpty(AppTitle))
+            while (AppCastNext.MoveNext())
             {
-                var titleAttribute =
-                    (AssemblyTitleAttribute) GetAttribute(mainAssembly, typeof(AssemblyTitleAttribute));
-                AppTitle = titleAttribute != null ? titleAttribute.Title : mainAssembly.GetName().Name;
-            }
+                e.Cancel = true;
+                Assembly mainAssembly = e.Argument as Assembly;
 
-            string appCompany = companyAttribute != null ? companyAttribute.Company : "";
-
-            RegistryLocation = !string.IsNullOrEmpty(appCompany)
-                ? $@"Software\{appCompany}\{AppTitle}\AutoUpdater"
-                : $@"Software\{AppTitle}\AutoUpdater";
-
-            InstalledVersion = mainAssembly.GetName().Version;
-
-            var webRequest = WebRequest.Create(AppCastURL);
-            webRequest.CachePolicy = new HttpRequestCachePolicy(HttpRequestCacheLevel.NoCacheNoStore);
-            if (Proxy != null)
-            {
-                webRequest.Proxy = Proxy;
-            }
-            WebResponse webResponse;
-
-            try
-            {
-                webResponse = webRequest.GetResponse();
-            }
-            catch (Exception)
-            {
-                e.Cancel = false;
-                return;
-            }
-            UpdateInfoEventArgs args;
-            using (Stream appCastStream = webResponse.GetResponseStream())
-            {
-                if (appCastStream != null)
+                var companyAttribute =
+                    (AssemblyCompanyAttribute)GetAttribute(mainAssembly, typeof(AssemblyCompanyAttribute));
+                if (string.IsNullOrEmpty(AppTitle))
                 {
-                    if (ParseUpdateInfoEvent != null)
+                    var titleAttribute =
+                        (AssemblyTitleAttribute)GetAttribute(mainAssembly, typeof(AssemblyTitleAttribute));
+                    AppTitle = titleAttribute != null ? titleAttribute.Title : mainAssembly.GetName().Name;
+                }
+
+                string appCompany = companyAttribute != null ? companyAttribute.Company : "";
+
+                RegistryLocation = !string.IsNullOrEmpty(appCompany)
+                    ? $@"Software\{appCompany}\{AppTitle}\AutoUpdater"
+                    : $@"Software\{AppTitle}\AutoUpdater";
+
+                InstalledVersion = mainAssembly.GetName().Version;
+
+                var webRequest = WebRequest.Create((string) AppCastNext.Current);
+                webRequest.CachePolicy = new HttpRequestCachePolicy(HttpRequestCacheLevel.NoCacheNoStore);
+                if (Proxy != null)
+                {
+                    webRequest.Proxy = Proxy;
+                }
+                WebResponse webResponse;
+
+                try
+                {
+                    webResponse = webRequest.GetResponse();
+                }
+                catch (Exception)
+                {
+                    e.Cancel = false;
+                    return;
+                }
+                UpdateInfoEventArgs args;
+                using (Stream appCastStream = webResponse.GetResponseStream())
+                {
+                    if (appCastStream != null)
                     {
-                        using (StreamReader streamReader = new StreamReader(appCastStream))
+                        if (ParseUpdateInfoEvent != null)
                         {
-                            string data = streamReader.ReadToEnd();
-                            ParseUpdateInfoEventArgs parseArgs = new ParseUpdateInfoEventArgs(data);
-                            ParseUpdateInfoEvent(parseArgs);
-                            args = parseArgs.UpdateInfo;
+                            using (StreamReader streamReader = new StreamReader(appCastStream))
+                            {
+                                string data = streamReader.ReadToEnd();
+                                ParseUpdateInfoEventArgs parseArgs = new ParseUpdateInfoEventArgs(data);
+                                ParseUpdateInfoEvent(parseArgs);
+                                args = parseArgs.UpdateInfo;
+                            }
+                        }
+                        else
+                        {
+                            XmlDocument receivedAppCastDocument = new XmlDocument();
+
+                            try
+                            {
+                                receivedAppCastDocument.Load(appCastStream);
+
+                                XmlNodeList appCastItems = receivedAppCastDocument.SelectNodes("item");
+
+                                args = new UpdateInfoEventArgs();
+
+                                if (appCastItems != null)
+                                {
+                                    foreach (XmlNode item in appCastItems)
+                                    {
+                                        XmlNode appCastVersion = item.SelectSingleNode("version");
+
+                                        try
+                                        {
+                                            CurrentVersion = new Version(appCastVersion?.InnerText);
+                                        }
+                                        catch (Exception)
+                                        {
+                                            CurrentVersion = null;
+                                        }
+
+                                        args.CurrentVersion = CurrentVersion;
+
+                                        XmlNode appCastChangeLog = item.SelectSingleNode("changelog");
+
+                                        args.ChangelogURL = appCastChangeLog?.InnerText;
+
+                                        XmlNode appCastUrl = item.SelectSingleNode("url");
+
+                                        args.DownloadURL = appCastUrl?.InnerText;
+
+                                        if (Mandatory.Equals(false))
+                                        {
+                                            XmlNode mandatory = item.SelectSingleNode("mandatory");
+
+                                            Boolean.TryParse(mandatory?.InnerText, out Mandatory);
+                                        }
+
+                                        args.Mandatory = Mandatory;
+
+                                        XmlNode appArgs = item.SelectSingleNode("args");
+
+                                        args.InstallerArgs = appArgs?.InnerText;
+
+                                        XmlNode checksum = item.SelectSingleNode("checksum");
+
+                                        args.HashingAlgorithm = checksum?.Attributes["algorithm"]?.InnerText;
+
+                                        args.Checksum = checksum?.InnerText;
+                                    }
+                                }
+                            }
+                            catch (XmlException)
+                            {
+                                e.Cancel = false;
+                                webResponse.Close();
+                                continue;
+                            }
                         }
                     }
                     else
                     {
-                        XmlDocument receivedAppCastDocument = new XmlDocument();
-
-                        try
-                        {
-                            receivedAppCastDocument.Load(appCastStream);
-
-                            XmlNodeList appCastItems = receivedAppCastDocument.SelectNodes("item");
-
-                            args = new UpdateInfoEventArgs();
-
-                            if (appCastItems != null)
-                            {
-                                foreach (XmlNode item in appCastItems)
-                                {
-                                    XmlNode appCastVersion = item.SelectSingleNode("version");
-
-                                    try
-                                    {
-                                        CurrentVersion = new Version(appCastVersion?.InnerText);
-                                    }
-                                    catch (Exception)
-                                    {
-                                        CurrentVersion = null;
-                                    }
-
-                                    args.CurrentVersion = CurrentVersion;
-
-                                    XmlNode appCastChangeLog = item.SelectSingleNode("changelog");
-
-                                    args.ChangelogURL = appCastChangeLog?.InnerText;
-
-                                    XmlNode appCastUrl = item.SelectSingleNode("url");
-
-                                    args.DownloadURL = appCastUrl?.InnerText;
-
-                                    if (Mandatory.Equals(false))
-                                    {
-                                        XmlNode mandatory = item.SelectSingleNode("mandatory");
-
-                                        Boolean.TryParse(mandatory?.InnerText, out Mandatory);
-                                    }
-
-                                    args.Mandatory = Mandatory;
-
-                                    XmlNode appArgs = item.SelectSingleNode("args");
-
-                                    args.InstallerArgs = appArgs?.InnerText;
-
-                                    XmlNode checksum = item.SelectSingleNode("checksum");
-
-                                    args.HashingAlgorithm = checksum?.Attributes["algorithm"]?.InnerText;
-
-                                    args.Checksum = checksum?.InnerText;
-                                }
-                            }
-                        }
-                        catch (XmlException)
-                        {
-                            e.Cancel = false;
-                            webResponse.Close();
-                            return;
-                        }
+                        e.Cancel = false;
+                        webResponse.Close();
+                        continue;
                     }
+                }
+
+                if (args.CurrentVersion == null || string.IsNullOrEmpty(args.DownloadURL))
+                {
+                    webResponse.Close();
+                    if (ReportErrors)
+                    {
+                        throw new InvalidDataException();
+                    }
+                    continue;
+                }
+
+                CurrentVersion = args.CurrentVersion;
+                ChangelogURL = args.ChangelogURL = GetURL(webResponse.ResponseUri, args.ChangelogURL);
+                DownloadURL = args.DownloadURL = GetURL(webResponse.ResponseUri, args.DownloadURL);
+                Mandatory = args.Mandatory;
+                InstallerArgs = args.InstallerArgs ?? String.Empty;
+                HashingAlgorithm = args.HashingAlgorithm ?? "MD5";
+                Checksum = args.Checksum ?? String.Empty;
+
+                webResponse.Close();
+
+                if (Mandatory)
+                {
+                    ShowRemindLaterButton = false;
+                    ShowSkipButton = false;
                 }
                 else
                 {
-                    e.Cancel = false;
-                    webResponse.Close();
-                    return;
-                }
-            }
-
-            if (args.CurrentVersion == null || string.IsNullOrEmpty(args.DownloadURL))
-            {
-                webResponse.Close();
-                if (ReportErrors)
-                {
-                    throw new InvalidDataException();
-                }
-                return;
-            }
-
-            CurrentVersion = args.CurrentVersion;
-            ChangelogURL = args.ChangelogURL = GetURL(webResponse.ResponseUri, args.ChangelogURL);
-            DownloadURL = args.DownloadURL = GetURL(webResponse.ResponseUri, args.DownloadURL);
-            Mandatory = args.Mandatory;
-            InstallerArgs = args.InstallerArgs ?? String.Empty;
-            HashingAlgorithm = args.HashingAlgorithm ?? "MD5";
-            Checksum = args.Checksum ?? String.Empty;
-
-            webResponse.Close();
-
-            if (Mandatory)
-            {
-                ShowRemindLaterButton = false;
-                ShowSkipButton = false;
-            }
-            else
-            {
-                using (RegistryKey updateKey = Registry.CurrentUser.OpenSubKey(RegistryLocation))
-                {
-                    if (updateKey != null)
+                    using (RegistryKey updateKey = Registry.CurrentUser.OpenSubKey(RegistryLocation))
                     {
-                        object skip = updateKey.GetValue("skip");
-                        object applicationVersion = updateKey.GetValue("version");
-                        if (skip != null && applicationVersion != null)
+                        if (updateKey != null)
                         {
-                            string skipValue = skip.ToString();
-                            var skipVersion = new Version(applicationVersion.ToString());
-                            if (skipValue.Equals("1") && CurrentVersion <= skipVersion)
-                                return;
-                            if (CurrentVersion > skipVersion)
+                            object skip = updateKey.GetValue("skip");
+                            object applicationVersion = updateKey.GetValue("version");
+                            if (skip != null && applicationVersion != null)
                             {
-                                using (RegistryKey updateKeyWrite = Registry.CurrentUser.CreateSubKey(RegistryLocation))
+                                string skipValue = skip.ToString();
+                                var skipVersion = new Version(applicationVersion.ToString());
+                                if (skipValue.Equals("1") && CurrentVersion <= skipVersion)
+                                    continue;
+                                if (CurrentVersion > skipVersion)
                                 {
-                                    if (updateKeyWrite != null)
+                                    using (RegistryKey updateKeyWrite = Registry.CurrentUser.CreateSubKey(RegistryLocation))
                                     {
-                                        updateKeyWrite.SetValue("version", CurrentVersion.ToString());
-                                        updateKeyWrite.SetValue("skip", 0);
+                                        if (updateKeyWrite != null)
+                                        {
+                                            updateKeyWrite.SetValue("version", CurrentVersion.ToString());
+                                            updateKeyWrite.SetValue("skip", 0);
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        object remindLaterTime = updateKey.GetValue("remindlater");
+                            object remindLaterTime = updateKey.GetValue("remindlater");
 
-                        if (remindLaterTime != null)
-                        {
-                            DateTime remindLater = Convert.ToDateTime(remindLaterTime.ToString(),
-                                CultureInfo.CreateSpecificCulture("en-US").DateTimeFormat);
-
-                            int compareResult = DateTime.Compare(DateTime.Now, remindLater);
-
-                            if (compareResult < 0)
+                            if (remindLaterTime != null)
                             {
-                                e.Cancel = false;
-                                e.Result = remindLater;
-                                return;
+                                DateTime remindLater = Convert.ToDateTime(remindLaterTime.ToString(),
+                                    CultureInfo.CreateSpecificCulture("en-US").DateTimeFormat);
+
+                                int compareResult = DateTime.Compare(DateTime.Now, remindLater);
+
+                                if (compareResult < 0)
+                                {
+                                    e.Cancel = false;
+                                    e.Result = remindLater;
+                                    return;
+                                }
                             }
                         }
                     }
                 }
+
+                args.IsUpdateAvailable = CurrentVersion > InstalledVersion;
+                args.InstalledVersion = InstalledVersion;
+
+                e.Cancel = false;
+                e.Result = args;
             }
-
-            args.IsUpdateAvailable = CurrentVersion > InstalledVersion;
-            args.InstalledVersion = InstalledVersion;
-
-            e.Cancel = false;
-            e.Result = args;
         }
 
         private static string GetURL(Uri baseUri, String url)
