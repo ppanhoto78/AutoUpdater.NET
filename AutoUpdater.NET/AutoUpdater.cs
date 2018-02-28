@@ -318,7 +318,7 @@ namespace AutoUpdaterDotNET
                 catch (Exception)
                 {
                     e.Cancel = false;
-                    return;
+                    continue;
                 }
                 UpdateInfoEventArgs args;
                 using (Stream appCastStream = webResponse.GetResponseStream())
@@ -486,6 +486,7 @@ namespace AutoUpdaterDotNET
 
                 e.Cancel = false;
                 e.Result = args;
+                break;
             }
         }
 
